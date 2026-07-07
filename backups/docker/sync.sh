@@ -2,8 +2,10 @@
 
 # ==============================================================================
 # Advanced UpdraftPlus Backup Collector
-# Auto-discovers running WordPress Docker containers and copies their
+# Auto-discovers running WordPress Docker containers and copies ALL
 # UpdraftPlus backups to the host server, organized by site and date.
+# Folder structure: ~/backups/updraft/<site>/<YYYY-MM-DD-HHMM>/
+# Skips files that already exist instead of overwriting.
 # ==============================================================================
 
 set -euo pipefail
@@ -22,8 +24,6 @@ UPDRAFT_DIRS=(
     "/var/www/html/wp-content/uploads/updraftplus"
     "/var/www/html/wp-content/backup"
 )
-DRY_RUN=false
-COPY_ALL_SETS=false  # If true, copy every backup set; if false, only latest per site
 
 # ------------------------------------------------------------------------------
 # Helper Functions
@@ -70,7 +70,6 @@ mkdir -p "$LOG_DIR"
 
 info "=== UpdraftPlus Backup Collector Started ==="
 info "Destination: $DEST_BASE"
-info "Dry run: $DRY_RUN"
 
 # ------------------------------------------------------------------------------
 # Discover WordPress containers
@@ -78,7 +77,6 @@ info "Dry run: $DRY_RUN"
 
 info "Discovering running WordPress containers..."
 
-# Try to find containers by image name containing "wordpress"
 WP_CONTAINERS=$(docker ps --format '{{.ID}}|{{.Image}}|{{.Names}}' | grep -i 'wordpress' || true)
 
 if [ -z "$WP_CONTAINERS" ]; then
@@ -87,7 +85,7 @@ if [ -z "$WP_CONTAINERS" ]; then
 fi
 
 if [ -z "$WP_CONTAINERS" ]; then
-    error "No running containers found at all. Exiting."
+    error "No running containers found. Exiting."
     exit 1
 fi
 
@@ -99,14 +97,13 @@ info "Found $TOTAL_CONTAINERS container(s) to process."
 # ------------------------------------------------------------------------------
 
 SUCCESS_COUNT=0
-FAIL_COUNT=0
+SKIP_COUNT=0
 
 while IFS='|' read -r CONTAINER_ID CONTAINER_IMAGE CONTAINER_NAME; do
 
     info "--------------------------------------------------"
     info "Processing container: $CONTAINER_NAME ($CONTAINER_IMAGE) [$CONTAINER_ID]"
 
-    # Determine which Updraft directory exists in this container
     SOURCE_DIR=""
     for DIR in "${UPDRAFT_DIRS[@]}"; do
         if docker exec "$CONTAINER_ID" test -d "$DIR" 2>/dev/null; then
@@ -118,11 +115,10 @@ while IFS='|' read -r CONTAINER_ID CONTAINER_IMAGE CONTAINER_NAME; do
 
     if [ -z "$SOURCE_DIR" ]; then
         warn "No UpdraftPlus backup directory found in $CONTAINER_NAME. Skipping."
-        ((FAIL_COUNT++)) || true
+        ((SKIP_COUNT++)) || true
         continue
     fi
 
-    # Get list of backup files
     FILES=$(docker exec "$CONTAINER_ID" ls -1 "$SOURCE_DIR" 2>/dev/null | grep -E '^backup_[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{4}_.+_[a-f0-9]+-' || true)
 
     if [ -z "$FILES" ]; then
@@ -130,8 +126,6 @@ while IFS='|' read -r CONTAINER_ID CONTAINER_IMAGE CONTAINER_NAME; do
         continue
     fi
 
-    # Group files by backup set prefix
-    # prefix format: backup_YYYY-MM-DD-HHMM_SiteName_HASH
     declare -A BACKUP_SETS
 
     while IFS= read -r FILE; do
@@ -141,53 +135,47 @@ while IFS='|' read -r CONTAINER_ID CONTAINER_IMAGE CONTAINER_NAME; do
         fi
     done <<< "$FILES"
 
-    # Determine which sets to copy
-    if [ "$COPY_ALL_SETS" = true ]; then
-        SETS_TO_PROCESS="${!BACKUP_SETS[@]}"
-    else
-        # Only copy the latest set per site
-        LATEST_BY_SITE=$(for PREFIX in "${!BACKUP_SETS[@]}"; do
-            SITE_NAME=$(echo "$PREFIX" | sed -E 's/backup_[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{4}_(.+)_[a-f0-9]+$/\1/')
-            echo "$SITE_NAME|$PREFIX"
-        done | sort -t'|' -k1,1 -k2,2r | awk -F'|' '!seen[$1]++ {print $2}')
-        SETS_TO_PROCESS="$LATEST_BY_SITE"
-    fi
+    TOTAL_SETS=${#BACKUP_SETS[@]}
+    info "Found $TOTAL_SETS backup set(s) in $CONTAINER_NAME"
 
-    for PREFIX in $SETS_TO_PROCESS; do
+    for PREFIX in "${!BACKUP_SETS[@]}"; do
 
-        # Extract metadata from prefix
-        BACKUP_DATE=$(echo "$PREFIX" | sed -E 's/backup_([0-9]{4}-[0-9]{2}-[0-9]{2})-.*/\1/')
-        BACKUP_TIME=$(echo "$PREFIX" | sed -E 's/backup_[0-9]{4}-[0-9]{2}-[0-9]{2}-([0-9]{4})-.*/\1/')
+        # Parse prefix: backup_YYYY-MM-DD-HHMM_SiteName_HASH
+        DATE_TIME=$(echo "$PREFIX" | sed -E 's/backup_([0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{4})_.*/\1/')
+        BACKUP_DATE=$(echo "$DATE_TIME" | sed -E 's/([0-9]{4}-[0-9]{2}-[0-9]{2})-.*/\1/')
+        BACKUP_TIME=$(echo "$DATE_TIME" | sed -E 's/[0-9]{4}-[0-9]{2}-[0-9]{2}-([0-9]{4})/\1/')
         SITE_NAME=$(echo "$PREFIX" | sed -E 's/backup_[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{4}_(.+)_[a-f0-9]+$/\1/')
         SITE_NAME_SAFE=$(echo "$SITE_NAME" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | tr -cd 'a-z0-9_-')
 
         DEST_DIR="$DEST_BASE/$SITE_NAME_SAFE/$BACKUP_DATE-$BACKUP_TIME"
         mkdir -p "$DEST_DIR"
 
-        info "Copying backup set for site '$SITE_NAME' from $BACKUP_DATE $BACKUP_TIME"
+        info "Processing backup set for site '$SITE_NAME' into $DEST_DIR"
 
-        # Copy each file in this set
         SET_FILES=$(echo "${BACKUP_SETS[$PREFIX]}" | grep -v '^$' || true)
         COPIED=0
+        EXISTED=0
 
         while IFS= read -r FILE; do
             [ -z "$FILE" ] && continue
 
-            if [ "$DRY_RUN" = true ]; then
-                info "[DRY-RUN] Would copy: $FILE -> $DEST_DIR/"
-                ((COPIED++)) || true
+            DEST_FILE="$DEST_DIR/$FILE"
+
+            if [ -f "$DEST_FILE" ]; then
+                warn "File already exists, skipping: $DEST_FILE"
+                ((EXISTED++)) || true
                 continue
             fi
 
             info "Copying $FILE ..."
-            if docker cp "$CONTAINER_ID:$SOURCE_DIR/$FILE" "$DEST_DIR/$FILE"; then
+            if docker cp "$CONTAINER_ID:$SOURCE_DIR/$FILE" "$DEST_FILE"; then
                 ((COPIED++)) || true
             else
                 error "Failed to copy $FILE from $CONTAINER_NAME"
             fi
         done <<< "$SET_FILES"
 
-        info "Copied $COPIED file(s) for $SITE_NAME to $DEST_DIR"
+        info "Copied $COPIED new file(s), skipped $EXISTED existing file(s) for $SITE_NAME"
 
     done
 
@@ -200,13 +188,8 @@ done <<< "$WP_CONTAINERS"
 # ------------------------------------------------------------------------------
 
 info "Cleaning up backups older than $RETENTION_DAYS days..."
-
-if [ "$DRY_RUN" = false ]; then
-    find "$DEST_BASE" -maxdepth 3 -type d -regextype posix-extended -regex '.*/[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{4}$' -mtime +$RETENTION_DAYS -exec rm -rf {} + 2>/dev/null || true
-    info "Cleanup completed."
-else
-    info "[DRY-RUN] Would cleanup backups older than $RETENTION_DAYS days."
-fi
+find "$DEST_BASE" -maxdepth 3 -type d -regextype posix-extended -regex '.*/[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{4}$' -mtime +$RETENTION_DAYS -exec rm -rf {} + 2>/dev/null || true
+info "Cleanup completed."
 
 # ------------------------------------------------------------------------------
 # Summary
@@ -214,9 +197,9 @@ fi
 
 info "=== Backup Collector Finished ==="
 info "Containers processed successfully: $SUCCESS_COUNT"
-info "Containers skipped/failed: $FAIL_COUNT"
+info "Containers skipped/failed: $SKIP_COUNT"
 
-if [ "$FAIL_COUNT" -gt 0 ]; then
+if [ "$SKIP_COUNT" -gt 0 ]; then
     exit 1
 fi
 
