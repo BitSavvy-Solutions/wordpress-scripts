@@ -12,8 +12,9 @@ set -euo pipefail
 # Configuration
 # ------------------------------------------------------------------------------
 
-DEST_BASE="/home/bitsavvyadmin/backups/updraft"
-LOG_FILE="/var/log/updraft-collector.log"
+DEST_BASE="$HOME/backups/updraft"
+LOG_DIR="$HOME/logs"
+LOG_FILE="$LOG_DIR/updraft-collector.log"
 LOCK_FILE="/tmp/updraft-collector.lock"
 RETENTION_DAYS=14
 UPDRAFT_DIRS=(
@@ -61,10 +62,11 @@ echo $$ > "$LOCK_FILE"
 trap cleanup_lock EXIT
 
 # ------------------------------------------------------------------------------
-# Create destination base
+# Create destination and log directories
 # ------------------------------------------------------------------------------
 
 mkdir -p "$DEST_BASE"
+mkdir -p "$LOG_DIR"
 
 info "=== UpdraftPlus Backup Collector Started ==="
 info "Destination: $DEST_BASE"
